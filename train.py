@@ -8,7 +8,7 @@ from model import VGG
 import utils
 
 
-# 流程：
+# 大体流程：
 # 1. 图像通过vgg获得特征图，
 # 2. 特征图通过RPN获得有效anchor的置信度(foreground)和转为预测框的坐标系数
 # 3. 特征图和预测框通过ROI Pooling获取固定尺寸的预测目标特征图,即利用预测框，从特征图中把目标抠出来，
@@ -64,7 +64,7 @@ print anchor_locations.shape  # 所有anchor对应的平移缩放系数（featur
 # ----------------------
 
 
-# --------------------step_2: VGG 和 RPN 模型: RPN 是预测的是anchor转为目标框的平移缩放系数
+# --------------------step_2: VGG 和 RPN 模型: RPN 预测的是anchor转为目标框的平移缩放系数
 vgg = VGG()
 # out_map 特征图， # pred_anchor_locs 预测anchor框到目标框转化的系数， pred_anchor_conf 预测anchor框的分数
 out_map, pred_anchor_locs, pred_anchor_conf = vgg.forward(img_var)
@@ -107,8 +107,8 @@ print("rpn_loss: {}".format(rpn_loss))  # 1.33919
 # ---------------------
 
 
-# ---------------------step_4: 根据anchor和预测anchor系数，计算预测框（roi）和预测框的坐标系数(gt_roi_locs)，
-# ---------------------并得到每个预测框的所属类别label(gt_roi_labels)
+# ---------------------step_4: 根据anchor和预测anchor系数，计算预测框（roi）和预测框的坐标系数(roi_locs)，
+# ---------------------并得到每个预测框的所属类别label(roi_labels)
 # 通过anchors框和模型预测的平移缩放系数，得到预测框ROI；再通过预测的分值和阈值进行过滤精简
 roi, score, order = utils.get_predict_bbox(anchors, pred_anchor_locs, objectness_score,
                                            n_train_pre_nms=12000, min_size=16)
@@ -119,8 +119,9 @@ roi = utils.nms(roi, score, order, nms_thresh=0.7, n_train_post_nms=2000)
 
 # 根据预测框ROI与目标框BBox的IOU，得到每个预测框所要预测的目标框（预测框与哪个目标框的IOU大，就代表预测哪个目标）；
 # 并根据IOU对ROI做进一步过滤，并划分正负样例。
-sample_roi, keep_index, gt_assignment, gt_roi_labels = utils.get_propose_target(roi, bbox, labels,
-                                                                                n_sample=128, pos_ratio=0.25,
+sample_roi, keep_index, gt_assignment, roi_labels = utils.get_propose_target(roi, bbox, labels,
+                                                                                n_sample=128,
+                                                                                pos_ratio=0.25,
                                                                                 pos_iou_thresh=0.5,
                                                                                 neg_iou_thresh_hi=0.5,
                                                                                 neg_iou_thresh_lo=0.0)
@@ -129,14 +130,17 @@ sample_roi, keep_index, gt_assignment, gt_roi_labels = utils.get_propose_target(
 bbox_for_sampled_roi = bbox[gt_assignment[keep_index]]  # 目标框
 print(bbox_for_sampled_roi.shape)  # (128, 4)
 # 预测框（ROI）转目标框的真实系数
-gt_roi_locs = utils.get_coefficient(sample_roi, bbox_for_sampled_roi)
+roi_locs = utils.get_coefficient(sample_roi, bbox_for_sampled_roi)
 # ---------------------
 
 
-# ---------------------step_5: ROI Pooling： ROI 预测的是预测框转为目标框的平移缩放系数（要与RPN区分）
-# 在预测预测框转为目标框的平移缩放系数时，有两个特点：
+# ---------------------step_5: ROI Pooling：
+# 这一步做了两件事：
+# 一是从特征图中根据ROI把相应的预测目标框抠出来(im)
+# 二是将抠出来的预测目标框通过adaptive_max_pool方法，输出为固定尺寸(512, 7, 7)，方便后续的批处理
+# 这样的特点：
 # 一是并没有在输入图像上预测，而是在VGG模型的输出特征图上进行预测，这样减少了计算量；
-# 二是因为目标实体尺寸多种多样，该处通过adaptive_max_pool方法，将输出统一为固定尺寸(512, 7, 7)，方便进行批处理，
+# 二是因为目标实体尺寸多种多样，通过ROI Pooling方法将输出统一为固定尺寸(512, 7, 7)，方便进行批处理，
 # sample_roi：预测的有效框 (128, 4)
 rois = torch.from_numpy(sample_roi).float()
 # roi_indices：添加图像的索引[这里我们只有一个图像，其索引号为0]
@@ -163,44 +167,46 @@ for i in range(num_rois):
    # print im.shape
    # 将抠出来的目标实体im，做adaptive_max_pool计算，最后得到一个固定的尺寸(7,7)== > (512, 7, 7)，方便后面进行批处理
    output.append(vgg.adaptive_max_pool(im)[0].data)
+# ---------------------ROI Pooling
 
-# if your pytorch version is 0.3.1, you must run this:
+
+# ---------------------step_6: Classification 线性分类，预测预测框的类别，置信度和转为目标框的平移缩放系数（要与RPN区分）
+# note: if your pytorch version is 0.3.1, you must run this:
 # output = torch.stack(output)
-
 output = torch.cat(output, 0)  # torch.Size([128, 512, 7, 7])
 k = output.view(output.size(0), -1)  # [128, 25088]
 
 k = torch.autograd.Variable(k)
 k = vgg.roi_head_classifier(k)  # (128, 4096)
 # torch.Size([128, 84])  84 ==> (20+1)*4,表示每个框有20个候选类别和一个置信度（假设为VOC数据集，共20分类），4表示坐标信息
-roi_cls_loc = vgg.cls_loc(k)
-# roi_cls_score： [128, 21] 表示每个框的类别和置信度
-roi_cls_score = vgg.score(k)
-print(roi_cls_loc.data.shape, roi_cls_score.data.shape)  # torch.Size([128, 84]), torch.Size([128, 21])
-# ---------------------ROI Pooling
+pred_roi_locs = vgg.cls_loc(k)
+# pred_roi_labels： [128, 21] 表示每个框的类别和置信度
+pred_roi_labels = vgg.score(k)
+print(pred_roi_locs.data.shape, pred_roi_labels.data.shape)  # torch.Size([128, 84]), torch.Size([128, 21])
+# ---------------------Classification
 
 
-# ---------------------step_6: ROI_Pooling 损失  (有效预测框真实系数与有效预测框的预测系数间损失，其中系数是转为目标框的坐标系数)
+# ---------------------step_7: 分类损失  (有效预测框真实系数与有效预测框的预测系数间损失，其中系数是转为目标框的坐标系数)
 # 从上面step_4中，我们得到了预测框转为目标框的目标信息：
-# 预测框的坐标系数(gt_roi_locs)：  (128, 4)
-# 预测框的所属类别(gt_roi_labels)：(128, )
+# 预测框的坐标系数(roi_locs)：  (128, 4)
+# 预测框的所属类别(roi_labels)：(128, )
 
-# 从上面step_5中，我们得到了预测框转为目标框的预测信息：
-# 预测框的坐标系数：roi_cls_loc  (128, 84)
-# 预测框的所属类别和置信度: roi_cls_score  (128, 21)
+# 从上面step_6中，我们得到了预测框转为目标框的预测信息：
+# 预测框的坐标系数：pred_roi_locs  (128, 84)
+# 预测框的所属类别和置信度: pred_roi_labels  (128, 21)
 
 
-gt_roi_loc = torch.from_numpy(gt_roi_locs)
-gt_roi_label = torch.from_numpy(np.float32(gt_roi_labels)).long()
+gt_roi_loc = torch.from_numpy(roi_locs)
+gt_roi_label = torch.from_numpy(np.float32(roi_labels)).long()
 print(gt_roi_loc.shape, gt_roi_label.shape)  # torch.Size([128, 4]) torch.Size([128])
 
-n_sample = roi_cls_loc.shape[0]
-roi_loc = roi_cls_loc.view(n_sample, -1, 4)  # (128L, 21L, 4L)
+n_sample = pred_roi_locs.shape[0]
+roi_loc = pred_roi_locs.view(n_sample, -1, 4)  # (128L, 21L, 4L)
 
 roi_loc = roi_loc[torch.arange(0, n_sample).long(), gt_roi_label]  # 根据预测框的真实类别，找到真实类别所对应的坐标系数
 # print(roi_loc.shape)  # torch.Size([128, 4])
 
-roi_loss = vgg.roi_loss(roi_loc, roi_cls_score, gt_roi_loc, gt_roi_label, weight=10.0)
+roi_loss = vgg.roi_loss(roi_loc, pred_roi_labels, gt_roi_loc, gt_roi_label, weight=10.0)
 print(roi_loss)  # 3.810348778963089
 
 
