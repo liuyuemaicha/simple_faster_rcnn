@@ -5,7 +5,7 @@ English Blog: https://medium.com/@fractaldle/guide-to-build-faster-rcnn-in-pytor
 
 Chinese Blog: 
 
-# Note: the current environment of Pytorch is 0.4.1 if you run this repository on Pytorch 0.3.1 ,please check the line 167 of train.py:
+# Note: the current environment of Pytorch is 0.4.1 if you run this repository on Pytorch 0.3.1 ,please check the line 174 of train.py:
 '''
 
 if your pytorch version is 0.3.1, you must run this:
